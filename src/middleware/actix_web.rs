@@ -10,12 +10,15 @@ use futures_util::future::LocalBoxFuture;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::{errors::LimiterError, limiter::{LimitEntityType, LimitThisConfig, Limiter, LimiterHeaders}};
+use crate::{
+    errors::LimiterError,
+    limiter::{BucketConfig, LimitEntityType, Limiter, LimiterHeaders},
+};
 
 #[derive(Debug, Clone)]
 pub struct ActixWebLimiterMiddleware {
     pub limiter: Arc<Mutex<Limiter>>,
-    pub middleware_limit_config: LimitThisConfig,
+    pub middleware_bucket_config: BucketConfig,
 }
 
 impl<S, B> Transform<S, ServiceRequest> for ActixWebLimiterMiddleware
@@ -31,8 +34,9 @@ where
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
-        if self.middleware_limit_config.limit_by != LimitEntityType::Global
-            && self.middleware_limit_config.limit_by != LimitEntityType::IP
+        if self.middleware_bucket_config.limit_by != LimitEntityType::Global
+            && self.middleware_bucket_config.limit_by != LimitEntityType::IP
+            && self.middleware_bucket_config.limit_by != LimitEntityType::ProxiedIP
         {
             panic!("Invalid limit_by value. Only Global and IP are supported.");
         }
@@ -40,7 +44,7 @@ where
         ready(Ok(ActixWebLimiterService {
             service: Arc::new(service),
             limiter: self.limiter.clone(),
-            middleware_limit_config: self.middleware_limit_config.clone(),
+            middleware_bucket_config: self.middleware_bucket_config.clone(),
         }))
     }
 }
@@ -48,7 +52,7 @@ where
 pub struct ActixWebLimiterService<S> {
     pub service: Arc<S>,
     pub limiter: Arc<Mutex<Limiter>>,
-    pub middleware_limit_config: LimitThisConfig,
+    pub middleware_bucket_config: BucketConfig,
 }
 
 impl<S, B> Service<ServiceRequest> for ActixWebLimiterService<S>
@@ -66,21 +70,21 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let limiter = self.limiter.clone();
         let service = self.service.clone();
-        let middleware_limit_config = self.middleware_limit_config.clone();
+        let middleware_bucket_config = self.middleware_bucket_config.clone();
 
         Box::pin(async move {
             let mut limiter = limiter.lock().await;
-            let (pass, limiter_result) = match middleware_limit_config.limit_by {
+            let (pass, limiter_result) = match middleware_bucket_config.limit_by {
                 LimitEntityType::Global => {
                     let result = limiter
                         .limit_this(
                             "_".to_owned(),
-                            LimitThisConfig {
-                                name: middleware_limit_config.name,
+                            BucketConfig {
+                                name: middleware_bucket_config.name,
                                 limit_by: LimitEntityType::Global,
-                                max_requests_per_cycle: middleware_limit_config
+                                max_requests_per_cycle: middleware_bucket_config
                                     .max_requests_per_cycle,
-                                cycle_duration: middleware_limit_config.cycle_duration,
+                                cycle_duration: middleware_bucket_config.cycle_duration,
                             },
                         )
                         .await;
@@ -89,19 +93,41 @@ where
                 LimitEntityType::IP => {
                     let ip = req
                         .connection_info()
+                        .peer_addr()
+                        .unwrap_or("_") // Limit all connections without known IP in the same limiter entity
+                        .to_string();
+
+                    let result = limiter
+                        .limit_this(
+                            ip.clone().to_owned(),
+                            BucketConfig {
+                                name: middleware_bucket_config.name,
+                                limit_by: LimitEntityType::IP,
+                                max_requests_per_cycle: middleware_bucket_config
+                                    .max_requests_per_cycle,
+                                cycle_duration: middleware_bucket_config.cycle_duration,
+                            },
+                        )
+                        .await;
+
+                    (false, result)
+                }
+                LimitEntityType::ProxiedIP => {
+                    let ip = req
+                        .connection_info()
                         .realip_remote_addr()
-                        .unwrap_or("_")
+                        .unwrap_or("_") // Limit all connections without known IP in the same limiter entity
                         .to_owned();
 
                     let result = limiter
                         .limit_this(
                             ip,
-                            LimitThisConfig {
-                                name: middleware_limit_config.name,
-                                limit_by: LimitEntityType::IP,
-                                max_requests_per_cycle: middleware_limit_config
+                            BucketConfig {
+                                name: middleware_bucket_config.name,
+                                limit_by: LimitEntityType::ProxiedIP,
+                                max_requests_per_cycle: middleware_bucket_config
                                     .max_requests_per_cycle,
-                                cycle_duration: middleware_limit_config.cycle_duration,
+                                cycle_duration: middleware_bucket_config.cycle_duration,
                             },
                         )
                         .await;
@@ -111,6 +137,8 @@ where
                 _ => (
                     true,
                     Ok(LimiterHeaders {
+                        key: "".to_owned(),
+                        bucket: "".to_owned(),
                         limit: 0,
                         remaining: 0,
                         reset: 0,
@@ -133,8 +161,9 @@ where
                     let limit_header_value = HeaderValue::from_str(&headers.limit.to_string())
                         .unwrap_or(HeaderValue::from_static("0"));
 
-                    let remaining_header_value = HeaderValue::from_str(&headers.remaining.to_string())
-                        .unwrap_or(HeaderValue::from_static("0"));
+                    let remaining_header_value =
+                        HeaderValue::from_str(&headers.remaining.to_string())
+                            .unwrap_or(HeaderValue::from_static("0"));
 
                     let reset_header_value = HeaderValue::from_str(&headers.reset.to_string())
                         .unwrap_or(HeaderValue::from_static("0"));
@@ -159,10 +188,18 @@ where
                 Err(err) => {
                     let too_much_requests_res = HttpResponse::TooManyRequests().finish();
                     match err {
-                        LimiterError::Limited=> Ok(req.into_response(too_much_requests_res).map_into_right_body()),
-                        LimiterError::MemoryLimitExceeded => Ok(req.into_response(too_much_requests_res).map_into_right_body()),
-                        LimiterError::RedisMemoryExceeded => Ok(req.into_response(too_much_requests_res).map_into_right_body()),
-                        LimiterError::BothMemoryAndRedisMemoryExceeded => Ok(req.into_response(too_much_requests_res).map_into_right_body()),
+                        LimiterError::Limited => Ok(req
+                            .into_response(too_much_requests_res)
+                            .map_into_right_body()),
+                        LimiterError::MemoryLimitExceeded => Ok(req
+                            .into_response(too_much_requests_res)
+                            .map_into_right_body()),
+                        LimiterError::RedisMemoryExceeded => Ok(req
+                            .into_response(too_much_requests_res)
+                            .map_into_right_body()),
+                        LimiterError::BothMemoryAndRedisMemoryExceeded => Ok(req
+                            .into_response(too_much_requests_res)
+                            .map_into_right_body()),
                         _ => {
                             let res = HttpResponse::InternalServerError().finish();
                             Ok(req.into_response(res).map_into_right_body())

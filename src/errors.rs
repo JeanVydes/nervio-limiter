@@ -23,6 +23,8 @@ pub enum LimiterError {
     RedisSetError,
     RedisGetUsageMemoryError,
 
+    NoIPFound,
+
     Limited,
 }
 

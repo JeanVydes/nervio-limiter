@@ -34,22 +34,24 @@ pub struct Limiter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LimitEntityType {
     Global,
-    IP,
-    AccountID,
+    IP, // For unproxied IP
+    ProxiedIP, // For services that are behind a proxy
+    ID,
     Custom(String),
 }
 
 #[derive(Debug, Clone)]
-pub struct LimitThisConfig {
+pub struct BucketConfig {
     pub name: String,
     pub limit_by: LimitEntityType,
-
     pub max_requests_per_cycle: u64,
     pub cycle_duration: Duration,
 }
 
 #[derive(Debug, Clone)]
 pub struct LimiterHeaders {
+    pub key: String,
+    pub bucket: String,
     pub limit: u64,
     pub remaining: u64,
     pub reset: u64,
@@ -178,12 +180,13 @@ impl Limiter {
     pub async fn limit_this(
         &mut self,
         mut entity_key: String,
-        config: LimitThisConfig,
+        config: BucketConfig,
     ) -> Result<LimiterHeaders, LimiterError> {
         let key_prefix = match config.limit_by {
             LimitEntityType::Global => "global",
             LimitEntityType::IP => "ip",
-            LimitEntityType::AccountID => "account_id",
+            LimitEntityType::ProxiedIP => "proxied_ip",
+            LimitEntityType::ID => "id",
             LimitEntityType::Custom(ref custom_key) => custom_key,
         };
 
@@ -191,7 +194,7 @@ impl Limiter {
             entity_key = "_".to_string();
         }
 
-        let key = format!("{}:{}:{}", config.name, key_prefix, entity_key);
+        let key = format!("{}:{}:{}", config.name.clone(), key_prefix, entity_key);
         let entity = self
             .get_entity(
                 key.clone(),
@@ -206,7 +209,7 @@ impl Limiter {
             // If expired, then create a new one
             if can_reset {
                 entity = self
-                    .reset_entity(key.clone(), entity.entity_type, config)
+                    .reset_entity(key.clone(), entity.entity_type, config.clone())
                     .await?;
             } else {
                 // Not expired yet
@@ -224,11 +227,13 @@ impl Limiter {
 
                 // Decrease the remaining count and update the entity
                 entity = self
-                    .decrease_remaining_and_update(key, entity.clone(), config)
+                    .decrease_remaining_and_update(key.clone(), entity.clone(), config.clone())
                     .await?;
             }
 
             return Ok(LimiterHeaders {
+                key,
+                bucket: config.name,
                 limit: entity.initial_supply,
                 remaining: entity.remaining,
                 reset: entity.expires_at,
@@ -323,6 +328,8 @@ impl Limiter {
         }
 
         Ok(LimiterHeaders {
+            key: key.to_owned(),
+            bucket: config.name,
             limit: new_entity.initial_supply,
             remaining: new_entity.remaining,
             reset: new_entity.expires_at,
@@ -371,7 +378,7 @@ impl Limiter {
         &mut self,
         key: String,
         entity_type: LimitEntityType,
-        config: LimitThisConfig,
+        config: BucketConfig,
     ) -> Result<Entity, LimiterError> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let expires_at = now + config.cycle_duration.as_millis() as u64;
@@ -410,7 +417,7 @@ impl Limiter {
         &mut self,
         key: String,
         mut entity: Entity,
-        config: LimitThisConfig,
+        config: BucketConfig,
     ) -> Result<Entity, LimiterError> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         if self.storage_type == StorageType::Redis && entity.remaining > 0 {
