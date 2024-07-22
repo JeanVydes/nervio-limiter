@@ -2,7 +2,7 @@
 name = "nervio-limiter"
 version = "0.1.0"
 edition = "2021"
-authors = ["Jean Vides <nerviolimiter@nervio.us>"]
+authors = ["Jean Vides <j@nervio.us>"]
 description = "The agnostic rate limiter for Rust"
 repository = "https://github.com/JeanVydes/nervio-limiter"
 
