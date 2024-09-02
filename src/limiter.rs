@@ -1,5 +1,4 @@
 use std::{sync::Arc, time::Duration};
-
 use hashbrown::HashMap;
 use log::{error, info};
 use redis::aio::MultiplexedConnection;
