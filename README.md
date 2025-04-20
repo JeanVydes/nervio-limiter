@@ -88,7 +88,8 @@ pub struct LimiterHeaders {
 * `x-ratelimit-bucket`: Bucket Name
 * `x-ratelimit-key`: The internal key to track the rate limit for requests
 
-**NOTE** ActixWebLimiterMiddleware, is only available behind `actix-web` feature flag
+**NOTE** `ActixWebLimiterMiddleware`, is only available behind `actix-web` feature flag.
+**NOTE** `axum_limiter_middleware`, is only available behind `axum` feature flag.
 
 ## Actix Web
 ```rust
@@ -157,10 +158,52 @@ pub async fn controller(
 }
 ```
 
+### Axum
+
+```rust
+use axum::{routing::get, Router, middleware};
+use std::time::Duration;
+
+async fn handler() -> &'static str {
+    "Hello, World!"
+}
+
+#[tokio::main]
+async fn main() {
+    // Initialize your limiter
+    let limiter = Arc::new(Mutex::new(Limiter::new())); // Or however you create it
+
+    // Define the configuration for this middleware instance
+    let limiter_config = BucketConfig {
+        name: "api_global".to_string(),
+        limit_by: LimitEntityType::ProxiedIP, // Or IP, Global
+        max_requests_per_cycle: 100,
+        cycle_duration: Duration::from_secs(60),
+    };
+
+    let app = Router::new()
+        .route("/", get(handler))
+        .layer(middleware::from_fn_with_state(
+            (limiter.clone(), limiter_config.clone()), // Pass state tuple
+            axum_limiter_middleware,
+        ));
+
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("Listening on {}", listener.local_addr().unwrap());
+
+    // its important the .into_make_service_with_connect_info::<SocketAddr>() to provide with the extractor the internal middleware `axum_limiter_middleware` that is important, and more with LimitEntityType::ProxiedIP like in this example
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async { /* ... shutdown signal ... */ })
+        .await
+        .unwrap();
+}
+```
+
 ## Contributions
 
 Feel free to contribute to this project :)
 
 ## Community
 
-(there aren't really a community, its just me) [https://discord.gg/xtBskESBnY](https://discord.gg/xtBskESBnY)
+(there aren't really a community, its just me)

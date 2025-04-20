@@ -7,19 +7,19 @@ description = "The agnostic rate limiter for Rust"
 repository = "https://github.com/JeanVydes/nervio-limiter"
 
 [dependencies]
-actix-web = { version = "4.8.0", optional = true }
-chrono = "0.4.38"
+axum = { version = "0.8", optional = true }
+actix-web = { version = "4", optional = true }
+chrono = "0.4"
 futures-util = { version = "0.3.30", optional = true }
-hashbrown = "0.14.5"
-log = "0.4.22"
-redis = { version = "0.25.4", features = ["tokio-comp","aio"] }
+hashbrown = "0.15"
+log = "0.4"
+redis = { version = "0.25.4", features = ["tokio-comp", "aio"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.120"
+serde_json = "1"
 tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
 
 [features]
 default = []
-actix-web = [
-    "dep:actix-web",
-    "dep:futures-util",
-]
+axum = ["dep:axum"]
+actix-web = ["dep:actix-web", "dep:futures-util"]

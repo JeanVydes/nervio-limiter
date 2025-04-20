@@ -7,6 +7,7 @@ use actix_web::{
     Error, HttpMessage, HttpResponse,
 };
 use futures_util::future::LocalBoxFuture;
+use tracing::warn;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -38,7 +39,11 @@ where
             && self.middleware_bucket_config.limit_by != LimitEntityType::IP
             && self.middleware_bucket_config.limit_by != LimitEntityType::ProxiedIP
         {
-            panic!("Invalid limit_by value. Only Global and IP are supported.");
+            warn!(
+                "Unsupported LimitEntityType configured: {:?}",
+                self.middleware_bucket_config.limit_by
+            );
+            return ready(Err(()))
         }
 
         ready(Ok(ActixWebLimiterService {

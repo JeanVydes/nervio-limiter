@@ -592,7 +592,7 @@ impl LimiterBuilder {
 
     pub fn build(self) -> Limiter {
         Limiter {
-            storage_type: self.storage_config.storage_type.unwrap(),
+            storage_type: self.storage_config.storage_type.unwrap_or(StorageType::InMemory),
             redis_conn: self.storage_config.redis_conn,
             in_memory: Arc::new(Mutex::new(HashMap::new())),
             max_memory_size: self.storage_config.max_memory_size,
