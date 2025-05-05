@@ -6,7 +6,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::{
@@ -19,7 +18,7 @@ static X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-
 static X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
 
 pub async fn axum_limiter_middleware(
-    State((limiter, middleware_bucket_config)): State<(Arc<Mutex<Limiter>>, BucketConfig)>,
+    State((limiter, middleware_bucket_config)): State<(Arc<Limiter>, BucketConfig)>, // Removed Mutex
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut request: Request<Body>,
     next: Next,
@@ -50,12 +49,7 @@ pub async fn axum_limiter_middleware(
         }
     };
 
-    let limiter_result = {
-        let mut limiter_guard = limiter.lock().await;
-        limiter_guard
-            .limit_this(key, middleware_bucket_config)
-            .await
-    };
+    let limiter_result = limiter.limit_this(key, &middleware_bucket_config).await;
 
     // --- Handle Limiter Result ---
     match limiter_result {
@@ -87,15 +81,20 @@ pub async fn axum_limiter_middleware(
         Err(err) => {
             warn!("Rate limiting error: {:?}", err); // Log the error
                                                      // Map LimiterError to an appropriate HTTP response
-            let status_code = match err {
-                LimiterError::Limited
-                | LimiterError::MemoryLimitExceeded
+            let (status_code, message) = match err {
+                LimiterError::Limited => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
+                // Map memory errors to 5xx to indicate server capacity issues
+                LimiterError::MemoryLimitExceeded
                 | LimiterError::RedisMemoryExceeded
-                | LimiterError::BothMemoryAndRedisMemoryExceeded => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::INTERNAL_SERVER_ERROR, // Handle other potential errors
+                | LimiterError::BothMemoryAndRedisMemoryExceeded => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service temporarily overloaded",
+                ),
+                // Keep other errors as Internal Server Error for now
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
             };
             // Return the error response directly
-            Err(status_code.into_response())
+            Err((status_code, message).into_response())
         }
     }
 }

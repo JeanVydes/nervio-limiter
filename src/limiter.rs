@@ -1,39 +1,46 @@
-use std::{sync::Arc, time::Duration};
-use hashbrown::HashMap;
-use log::{error, info};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use dashmap::DashMap;
+use log::{debug, error, info, warn};
 use redis::aio::MultiplexedConnection;
 use serde::{de, Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crate::{
     errors::LimiterError,
-    storage::{get_hashmap_memory_size, get_redis_memory_usage, StorageConfig, StorageType},
+    storage::{get_redis_memory_usage, StorageConfig, StorageType},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Limiter {
     pub storage_type: StorageType,
 
     pub redis_conn: Option<MultiplexedConnection>,
 
-    pub in_memory: Arc<Mutex<HashMap<String, Entity>>>,
+    pub in_memory: Arc<DashMap<String, Entity>>,
 
     pub max_memory_size: Option<u64>, // in MB
     pub max_redis_size: Option<u64>,  // in MB
 
     pub acceptable_last_accesed_time_to_cache_redis_in_memory: Duration,
 
-    pub current_redis_memory_usage: Option<Arc<Mutex<u64>>>,
-    pub last_fetched_redis_memory_usage: Option<u64>,
+    // These are updated periodically by a background task
+    pub current_redis_memory_usage_mb: Arc<AtomicU64>,
+    pub current_memory_usage_mb: Arc<AtomicU64>,
 
-    pub current_memory_usage: Option<Arc<Mutex<u64>>>,
-    pub last_fetched_memory_usage: Option<u64>,
+    // Handle for the background task
+    _memory_check_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LimitEntityType {
     Global,
-    IP, // For unproxied IP
+    IP,        // For unproxied IP
     ProxiedIP, // For services that are behind a proxy
     ID,
     Custom(String),
@@ -78,17 +85,17 @@ impl Limiter {
         Limiter {
             storage_type,
             redis_conn,
-            in_memory: Arc::new(Mutex::new(HashMap::new())),
+            in_memory: Arc::new(DashMap::new()),
             max_memory_size,
             max_redis_size,
 
             acceptable_last_accesed_time_to_cache_redis_in_memory,
 
-            current_redis_memory_usage: None,
-            last_fetched_redis_memory_usage: None,
+            current_redis_memory_usage_mb: Arc::new(AtomicU64::new(0)),
+            current_memory_usage_mb: Arc::new(AtomicU64::new(0)),
 
-            current_memory_usage: None,
-            last_fetched_memory_usage: None,
+            // Background task handle would be set up later, perhaps in `build` or a dedicated start method
+            _memory_check_handle: None,
         }
     }
 
@@ -97,7 +104,7 @@ impl Limiter {
     }
 
     pub async fn add_to_redis<T>(
-        &mut self,
+        &self,
         key: String,
         value: T,
         duration: Duration,
@@ -106,25 +113,21 @@ impl Limiter {
         T: Serialize + Clone,
     {
         let redis_conn = match self.redis_conn {
-            Some(ref conn) => conn,
+            // Clone the connection
+            Some(ref conn) => conn.clone(),
             None => return Err(LimiterError::NotRedisConfigured),
         };
 
-        let exp = duration.as_millis() as u64;
+        let exp_ms = duration.as_millis(); // Keep as u128 for precision if needed, but usize for command
         let parsed_value =
             serde_json::to_string(&value).map_err(|_| LimiterError::SerializationError)?;
 
-        let _ = redis::cmd("SET")
+        // Use SET with PX for atomic set + expire
+        match redis::cmd("SET")
             .arg(&key)
             .arg(parsed_value)
-            .query_async::<MultiplexedConnection, ()>(&mut redis_conn.clone())
-            .await
-            .map_err(|_| return Err::<T, LimiterError>(LimiterError::RedisSetError));
-
-        // Then, set the expiration
-        match redis::cmd("PEXPIRE")
-            .arg(&key)
-            .arg(exp)
+            .arg("PX")
+            .arg(exp_ms as usize) // PX expects milliseconds as integer
             .query_async::<MultiplexedConnection, ()>(&mut redis_conn.clone())
             .await
         {
@@ -133,22 +136,23 @@ impl Limiter {
         }
     }
 
-    pub async fn get_from_redis<T>(&mut self, key: String) -> Result<Option<T>, LimiterError>
+    pub async fn get_from_redis<T>(&self, key: String) -> Result<Option<T>, LimiterError>
     where
         T: de::DeserializeOwned,
     {
-        let redis_conn = match self.redis_conn {
-            Some(ref conn) => conn,
+        let mut redis_conn = match self.redis_conn {
+            // Clone the connection
+            Some(ref conn) => conn.clone(),
             None => return Err(LimiterError::NotRedisConfigured),
         };
 
         let value: Option<String> = match redis::cmd("GET")
             .arg(&key)
-            .query_async::<MultiplexedConnection, Option<String>>(&mut redis_conn.clone())
+            .query_async::<MultiplexedConnection, Option<String>>(&mut redis_conn)
             .await
         {
             Ok(v) => v,
-            Err(_) => return Err(LimiterError::RedisSetError),
+            Err(_) => return Err(LimiterError::RedisGetError), // Use more specific error
         };
 
         match value {
@@ -160,26 +164,27 @@ impl Limiter {
         }
     }
 
-    pub async fn delete_from_redis(&mut self, key: String) -> Result<(), LimiterError> {
-        let redis_conn = match self.redis_conn {
-            Some(ref conn) => conn,
+    pub async fn delete_from_redis(&self, key: String) -> Result<(), LimiterError> {
+        let mut redis_conn = match self.redis_conn {
+            // Clone the connection
+            Some(ref conn) => conn.clone(),
             None => return Err(LimiterError::NotRedisConfigured),
         };
 
         match redis::cmd("DEL")
             .arg(&key)
-            .query_async::<MultiplexedConnection, ()>(&mut redis_conn.clone())
-            .await
+            .query_async::<MultiplexedConnection, ()>(&mut redis_conn)
+            .await // Removed clone here
         {
             Ok(_) => Ok(()),
-            Err(_) => Err(LimiterError::RedisSetError),
+            Err(_) => Err(LimiterError::RedisDelError), // Use more specific error
         }
     }
 
     pub async fn limit_this(
-        &mut self,
+        &self, // Changed to &self
         mut entity_key: String,
-        config: BucketConfig,
+        config: &BucketConfig,
     ) -> Result<LimiterHeaders, LimiterError> {
         let key_prefix = match config.limit_by {
             LimitEntityType::Global => "global",
@@ -208,7 +213,7 @@ impl Limiter {
             // If expired, then create a new one
             if can_reset {
                 entity = self
-                    .reset_entity(key.clone(), entity.entity_type, config.clone())
+                    .reset_entity(key.clone(), entity.entity_type, &config)
                     .await?;
             } else {
                 // Not expired yet
@@ -226,25 +231,23 @@ impl Limiter {
 
                 // Decrease the remaining count and update the entity
                 entity = self
-                    .decrease_remaining_and_update(key.clone(), entity.clone(), config.clone())
+                    .decrease_remaining_and_update(key.clone(), entity.clone(), &config)
                     .await?;
             }
 
             return Ok(LimiterHeaders {
                 key,
-                bucket: config.name,
+                bucket: config.name.clone(),
                 limit: entity.initial_supply,
                 remaining: entity.remaining,
                 reset: entity.expires_at,
             });
         }
 
-        let _ = self.check_and_update_memory_usage().await;
-
         // If entity is not found, the create a new one
         let expires_at = now + config.cycle_duration.as_millis() as u64;
         let new_entity = Entity {
-            entity_type: config.limit_by,
+            entity_type: config.limit_by.clone(),
             initial_supply: config.max_requests_per_cycle,
             remaining: config.max_requests_per_cycle,
             created_at: now,
@@ -254,58 +257,37 @@ impl Limiter {
 
         // Save the new entity
         if self.storage_type == StorageType::Redis {
+            // Check pre-calculated memory usage
             if let Some(max_memory_size) = self.max_redis_size {
-                if let Some(current_memory_usage) = &self.current_redis_memory_usage {
-                    let current_memory_usage = current_memory_usage.lock().await;
-                    let size_in_mb = *current_memory_usage as f64 / (1024.0 * 1024.0);
-                    if size_in_mb > max_memory_size as f64 {
-                        return Err(LimiterError::RedisMemoryExceeded);
-                    }
+                if self.current_memory_usage_mb.load(Ordering::SeqCst) > max_memory_size {
+                    return Err(LimiterError::RedisMemoryExceeded);
                 }
             }
 
             self.add_to_redis(key.clone(), new_entity.clone(), config.cycle_duration)
                 .await?
         } else if self.storage_type == StorageType::InMemory {
-            // Check if max_memory_size is provide and then check against hashmap size
+            // Check pre-calculated memory usage
             if let Some(max_memory_size) = self.max_memory_size {
-                if let Some(current_memory_usage) = &self.current_memory_usage {
-                    let current_memory_usage = current_memory_usage.lock().await;
-
-                    let size_in_mb = *current_memory_usage as f64 / (1024.0 * 1024.0);
-
-                    if size_in_mb > max_memory_size as f64 {
-                        return Err(LimiterError::MemoryLimitExceeded);
-                    }
+                if self.current_memory_usage_mb.load(Ordering::SeqCst) > max_memory_size {
+                    return Err(LimiterError::MemoryLimitExceeded);
                 }
             }
 
-            self.in_memory
-                .lock()
-                .await
-                .insert(key.clone(), new_entity.clone());
+            self.in_memory.insert(key.clone(), new_entity.clone()); // Use DashMap insert
         } else if self.storage_type == StorageType::RedisAndMemoryMix {
             let mut memory_excceded = false;
             let mut redis_memory_excceded = false;
 
             if let Some(max_memory_size) = self.max_memory_size {
-                // Passing the pointer to the in-memory hashmap
-                let size_in_bytes =
-                    get_hashmap_memory_size::<String, Entity>(self.in_memory.clone()).await;
-                let size_in_mb = size_in_bytes as f64 / (1024.0 * 1024.0);
-
-                if size_in_mb > max_memory_size as f64 {
+                if self.current_memory_usage_mb.load(Ordering::SeqCst) > max_memory_size {
                     memory_excceded = true;
                 }
             }
 
             if let Some(max_memory_size) = self.max_redis_size {
-                if let Some(current_memory_usage) = &self.current_redis_memory_usage {
-                    let current_memory_usage = current_memory_usage.lock().await;
-                    let size_in_mb = *current_memory_usage as f64 / (1024.0 * 1024.0);
-                    if size_in_mb > max_memory_size as f64 {
-                        redis_memory_excceded = true;
-                    }
+                if self.current_memory_usage_mb.load(Ordering::SeqCst) > max_memory_size {
+                    redis_memory_excceded = true;
                 }
             }
 
@@ -314,10 +296,7 @@ impl Limiter {
             }
 
             if !memory_excceded {
-                self.in_memory
-                    .lock()
-                    .await
-                    .insert(key.clone(), new_entity.clone());
+                self.in_memory.insert(key.clone(), new_entity.clone()); // Use DashMap insert
             }
 
             if !redis_memory_excceded {
@@ -328,7 +307,7 @@ impl Limiter {
 
         Ok(LimiterHeaders {
             key: key.to_owned(),
-            bucket: config.name,
+            bucket: config.name.clone(),
             limit: new_entity.initial_supply,
             remaining: new_entity.remaining,
             reset: new_entity.expires_at,
@@ -336,7 +315,7 @@ impl Limiter {
     }
 
     pub async fn get_entity(
-        &mut self,
+        &self, // Changed to &self
         key: String,
         acceptable_last_accesed_time_to_cache_redis_in_memory: Duration,
     ) -> Result<Option<Entity>, LimiterError> {
@@ -344,9 +323,9 @@ impl Limiter {
         if self.storage_type == StorageType::Redis {
             entity = self.get_from_redis(key.clone()).await?;
         } else if self.storage_type == StorageType::InMemory {
-            entity = self.in_memory.lock().await.get(&key).cloned();
+            entity = self.in_memory.get(&key).map(|e| e.value().clone()); // Use DashMap get
         } else if self.storage_type == StorageType::RedisAndMemoryMix {
-            entity = self.in_memory.lock().await.get(&key).cloned();
+            entity = self.in_memory.get(&key).map(|e| e.value().clone()); // Use DashMap get
 
             let now = chrono::Utc::now().timestamp_millis() as u64;
 
@@ -359,10 +338,7 @@ impl Limiter {
                         < acceptable_last_accesed_time_to_cache_redis_in_memory.as_millis() as u64;
 
                     if now < entity.expires_at && was_accesed_in_the_last_acceptable_time {
-                        self.in_memory
-                            .lock()
-                            .await
-                            .insert(key.clone(), entity.clone());
+                        self.in_memory.insert(key.clone(), entity.clone()); // Use DashMap insert
                     }
                 }
             }
@@ -374,10 +350,10 @@ impl Limiter {
     }
 
     pub async fn reset_entity(
-        &mut self,
+        &self, // Changed to &self
         key: String,
         entity_type: LimitEntityType,
-        config: BucketConfig,
+        config: &BucketConfig,
     ) -> Result<Entity, LimiterError> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let expires_at = now + config.cycle_duration.as_millis() as u64;
@@ -395,15 +371,9 @@ impl Limiter {
             self.add_to_redis(key.clone(), entity.clone(), config.cycle_duration)
                 .await?
         } else if self.storage_type == StorageType::InMemory {
-            self.in_memory
-                .lock()
-                .await
-                .insert(key.clone(), entity.clone());
+            self.in_memory.insert(key.clone(), entity.clone()); // Use DashMap insert
         } else if self.storage_type == StorageType::RedisAndMemoryMix {
-            self.in_memory
-                .lock()
-                .await
-                .insert(key.clone(), entity.clone());
+            self.in_memory.insert(key.clone(), entity.clone()); // Use DashMap insert
 
             self.add_to_redis(key.clone(), entity.clone(), config.cycle_duration)
                 .await?
@@ -413,10 +383,10 @@ impl Limiter {
     }
 
     pub async fn decrease_remaining_and_update(
-        &mut self,
+        &self, // Changed to &self
         key: String,
         mut entity: Entity,
-        config: BucketConfig,
+        config: &BucketConfig,
     ) -> Result<Entity, LimiterError> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         if self.storage_type == StorageType::Redis && entity.remaining > 0 {
@@ -429,10 +399,7 @@ impl Limiter {
             entity.remaining -= 1;
             entity.last_accessed_at = now;
 
-            self.in_memory
-                .lock()
-                .await
-                .insert(key.clone(), entity.clone());
+            self.in_memory.insert(key.clone(), entity.clone()); // Use DashMap insert
         } else if self.storage_type == StorageType::RedisAndMemoryMix && entity.remaining > 0 {
             let not_too_much_demanded = (now - entity.last_accessed_at)
                 > self
@@ -440,13 +407,10 @@ impl Limiter {
                     .as_millis() as u64;
 
             if not_too_much_demanded {
-                self.in_memory.lock().await.remove(&key);
+                self.in_memory.remove(&key); // Use DashMap remove
             } else {
                 entity.remaining -= 1;
-                self.in_memory
-                    .lock()
-                    .await
-                    .insert(key.clone(), entity.clone());
+                self.in_memory.insert(key.clone(), entity.clone()); // Use DashMap insert
             }
 
             self.add_to_redis(key.clone(), entity.clone(), config.cycle_duration)
@@ -456,89 +420,94 @@ impl Limiter {
         Ok(entity)
     }
 
-    pub async fn check_and_update_memory_usage(&mut self) -> Result<(), LimiterError> {
-        if self.storage_type == StorageType::Redis {
-            if let Some(max_redis_size) = self.max_redis_size {
-                // If max_redis_size its not provided, then it's not necessary to check the memory usage
-                // But the recommended is to always provide the max_redis_size
+    // This should be spawned as a background task, e.g., in the `build` method or a dedicated `start` method.
+    async fn memory_check_task(
+        interval: Duration,
+        storage_type: StorageType,
+        redis_conn: Option<MultiplexedConnection>,
+        in_memory_map: Option<Arc<DashMap<String, Entity>>>, // Changed type
+        max_redis_size_mb: Option<u64>,
+        max_memory_size_mb: Option<u64>,
+        current_redis_mb: Arc<AtomicU64>,
+        current_memory_mb: Arc<AtomicU64>,
+    ) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            debug!("Running periodic memory check...");
 
-                let last_fetched_redis_memory_usage =
-                    self.last_fetched_redis_memory_usage.unwrap_or(0);
-
-                let now = chrono::Utc::now().timestamp_millis() as u64;
-                let acceptable_time_to_fetch_redis_memory_usage = Duration::from_secs(5);
-
-                let can_fetch_redis_memory_usage = (now - last_fetched_redis_memory_usage)
-                    > acceptable_time_to_fetch_redis_memory_usage.as_millis() as u64;
-
-                // Check if it's time to fetch the memory usage
-                if can_fetch_redis_memory_usage {
-                    let redis_conn = match &self.redis_conn {
-                        Some(conn) => conn,
-                        None => return Err(LimiterError::NotRedisConfigured),
-                    };
-
-                    let redis_memory_usage =
-                        get_redis_memory_usage(&mut redis_conn.clone()).await?;
-                    let redis_memory_usage_mb = redis_memory_usage as f64 / (1024.0 * 1024.0);
-
-                    info!(
-                        "Redis Memory Usage: {:?}MB/{:?}MB",
-                        redis_memory_usage_mb, max_redis_size
-                    );
-                    if redis_memory_usage_mb > max_redis_size as f64 {
-                        error!(
-                            "REDIS MEMORY HAS REACHED THE LIMIT {:?}MB/{:?}MB",
-                            redis_memory_usage_mb, max_redis_size
-                        );
+            // Check Redis Memory
+            if (storage_type == StorageType::Redis
+                || storage_type == StorageType::RedisAndMemoryMix)
+                && redis_conn.is_some()
+            {
+                let mut conn = redis_conn.clone().unwrap(); // Safe unwrap due to check above
+                match get_redis_memory_usage(&mut conn).await {
+                    Ok(usage_bytes) => {
+                        let usage_mb = usage_bytes as f64 / (1024.0 * 1024.0);
+                        current_redis_mb.store(usage_mb as u64, Ordering::SeqCst);
+                        debug!("Current Redis memory usage: {:.2} MB", usage_mb);
+                        if let Some(max_mb) = max_redis_size_mb {
+                            if usage_mb > max_mb as f64 {
+                                error!(
+                                    "REDIS MEMORY LIMIT EXCEEDED: {:.2}MB / {}MB",
+                                    usage_mb, max_mb
+                                );
+                            }
+                        }
                     }
-
-                    if let Some(current_redis_memory_usage_mb) = &self.current_redis_memory_usage {
-                        let mut current_redis_memory_usage_mb =
-                            current_redis_memory_usage_mb.lock().await;
-
-                        *current_redis_memory_usage_mb = redis_memory_usage_mb as u64;
-                    } else {
-                        self.current_redis_memory_usage =
-                            Some(Arc::new(Mutex::new(redis_memory_usage_mb as u64)));
+                    Err(e) => {
+                        warn!("Failed to get Redis memory usage: {:?}", e);
+                        // Optionally clear the value or keep the stale one
+                        // *current_redis_mb.lock().await = None;
                     }
+                }
+            }
 
-                    self.last_fetched_redis_memory_usage =
-                        Some(chrono::Utc::now().timestamp_millis() as u64);
+            // Check In-Memory Map Size
+            if (storage_type == StorageType::InMemory
+                || storage_type == StorageType::RedisAndMemoryMix)
+                && in_memory_map.is_some()
+            {
+                // Note: Calculating exact memory size for DashMap is complex.
+                // We'll use len() * size_of entry as a rough estimate.
+                // For a more accurate (but potentially slower) size, you'd need to iterate.
+                let map_arc = in_memory_map.clone().unwrap(); // Safe unwrap
+                let usage_bytes = get_dashmap_approx_memory_size(&map_arc); // Use new helper
+                let usage_mb = usage_bytes as f64 / (1024.0 * 1024.0);
+                current_memory_mb.store(usage_mb as u64, Ordering::SeqCst);
+                debug!("Current In-Memory usage: {:.2} MB", usage_mb);
+                if let Some(max_mb) = max_memory_size_mb {
+                    if usage_mb > max_mb as f64 {
+                        error!("IN-MEMORY LIMIT EXCEEDED: {:.2}MB / {}MB", usage_mb, max_mb);
+                    }
                 }
             }
         }
+    }
 
-        if self.storage_type == StorageType::RedisAndMemoryMix
-            || self.storage_type == StorageType::InMemory
-        {
-            let last_fetched_memory_usage = self.last_fetched_memory_usage.unwrap_or(0);
-
-            let now = chrono::Utc::now().timestamp_millis() as u64;
-            let acceptable_time_to_fetch_memory_usage = Duration::from_secs(5);
-
-            let can_fetch_memory_usage = (now - last_fetched_memory_usage)
-                > acceptable_time_to_fetch_memory_usage.as_millis() as u64;
-
-            // Check if it's time to fetch the memory usage
-            if can_fetch_memory_usage {
-                let memory_usage =
-                    get_hashmap_memory_size::<String, Entity>(self.in_memory.clone()).await;
-                let memory_usage_mb = memory_usage as f64 / (1024.0 * 1024.0);
-
-                if let Some(current_memory_usage_mb) = &self.current_memory_usage {
-                    let mut current_memory_usage_mb = current_memory_usage_mb.lock().await;
-
-                    *current_memory_usage_mb = memory_usage_mb as u64;
-                } else {
-                    self.current_memory_usage = Some(Arc::new(Mutex::new(memory_usage_mb as u64)));
-                }
-
-                self.last_fetched_memory_usage = Some(chrono::Utc::now().timestamp_millis() as u64);
-            }
+    // Helper to start the background task
+    pub fn start_memory_check_task(&mut self, interval: Duration) {
+        // Prevent starting multiple tasks if called again
+        if self._memory_check_handle.is_some() {
+            warn!("Memory check task already started.");
+            return;
         }
-
-        Ok(())
+        info!(
+            "Starting periodic memory check task with interval {:?}",
+            interval
+        );
+        let task = tokio::spawn(Self::memory_check_task(
+            interval,
+            self.storage_type.clone(),
+            self.redis_conn.clone(),
+            Some(self.in_memory.clone()),
+            self.max_redis_size,
+            self.max_memory_size,
+            self.current_redis_memory_usage_mb.clone(),
+            self.current_memory_usage_mb.clone(),
+        ));
+        self._memory_check_handle = Some(task);
     }
 }
 
@@ -591,10 +560,13 @@ impl LimiterBuilder {
     }
 
     pub fn build(self) -> Limiter {
-        Limiter {
-            storage_type: self.storage_config.storage_type.unwrap_or(StorageType::InMemory),
+        let mut limiter = Limiter {
+            storage_type: self
+                .storage_config
+                .storage_type
+                .unwrap_or(StorageType::InMemory),
             redis_conn: self.storage_config.redis_conn,
-            in_memory: Arc::new(Mutex::new(HashMap::new())),
+            in_memory: Arc::new(DashMap::new()),
             max_memory_size: self.storage_config.max_memory_size,
             max_redis_size: self.storage_config.max_redis_size,
 
@@ -603,11 +575,20 @@ impl LimiterBuilder {
                 .acceptable_last_accesed_time_to_cache_redis_in_memory
                 .unwrap_or(Duration::from_secs(5)),
 
-            current_redis_memory_usage: None,
-            last_fetched_redis_memory_usage: None,
+            current_redis_memory_usage_mb: Arc::new(AtomicU64::new(0)),
+            current_memory_usage_mb: Arc::new(AtomicU64::new(0)),
 
-            current_memory_usage: None,
-            last_fetched_memory_usage: None,
-        }
+            _memory_check_handle: None, // Placeholder
+        };
+
+        let check_interval = Duration::from_secs(5);
+        limiter.start_memory_check_task(check_interval);
+
+        limiter
     }
+}
+
+fn get_dashmap_approx_memory_size<K: Eq + std::hash::Hash, V>(map: &DashMap<K, V>) -> usize {
+    map.len() * (std::mem::size_of::<K>() + std::mem::size_of::<V>())
+        + map.capacity() * std::mem::size_of::<usize>() // Rough estimate
 }

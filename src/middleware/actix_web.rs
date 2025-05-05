@@ -8,17 +8,17 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 use tracing::warn;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::{
     errors::LimiterError,
     limiter::{BucketConfig, LimitEntityType, Limiter, LimiterHeaders},
 };
 
+use std::sync::Arc;
+
 #[derive(Debug, Clone)]
 pub struct ActixWebLimiterMiddleware {
-    pub limiter: Arc<Mutex<Limiter>>,
+    pub limiter: Arc<Limiter>, // Removed Mutex
     pub middleware_bucket_config: BucketConfig,
 }
 
@@ -43,7 +43,7 @@ where
                 "Unsupported LimitEntityType configured: {:?}",
                 self.middleware_bucket_config.limit_by
             );
-            return ready(Err(()))
+            return ready(Err(()));
         }
 
         ready(Ok(ActixWebLimiterService {
@@ -56,7 +56,7 @@ where
 
 pub struct ActixWebLimiterService<S> {
     pub service: Arc<S>,
-    pub limiter: Arc<Mutex<Limiter>>,
+    pub limiter: Arc<Limiter>, // Removed Mutex
     pub middleware_bucket_config: BucketConfig,
 }
 
@@ -78,13 +78,12 @@ where
         let middleware_bucket_config = self.middleware_bucket_config.clone();
 
         Box::pin(async move {
-            let mut limiter = limiter.lock().await;
             let (pass, limiter_result) = match middleware_bucket_config.limit_by {
                 LimitEntityType::Global => {
                     let result = limiter
                         .limit_this(
                             "_".to_owned(),
-                            BucketConfig {
+                            &BucketConfig {
                                 name: middleware_bucket_config.name,
                                 limit_by: LimitEntityType::Global,
                                 max_requests_per_cycle: middleware_bucket_config
@@ -105,7 +104,7 @@ where
                     let result = limiter
                         .limit_this(
                             ip.clone().to_owned(),
-                            BucketConfig {
+                            &BucketConfig {
                                 name: middleware_bucket_config.name,
                                 limit_by: LimitEntityType::IP,
                                 max_requests_per_cycle: middleware_bucket_config
@@ -127,7 +126,7 @@ where
                     let result = limiter
                         .limit_this(
                             ip,
-                            BucketConfig {
+                            &BucketConfig {
                                 name: middleware_bucket_config.name,
                                 limit_by: LimitEntityType::ProxiedIP,
                                 max_requests_per_cycle: middleware_bucket_config
