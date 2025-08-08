@@ -77,6 +77,7 @@ where
         let service = self.service.clone();
         let middleware_bucket_config = self.middleware_bucket_config.clone();
 
+        let cloudflare_custom_key = "cloudflare".to_string();
         Box::pin(async move {
             let (pass, limiter_result) = match middleware_bucket_config.limit_by {
                 LimitEntityType::Global => {
@@ -137,6 +138,44 @@ where
                         .await;
 
                     (false, result)
+                }
+                LimitEntityType::Custom(custom) => {
+                    if custom == cloudflare_custom_key {
+                        let mut ip: Option<String> = None;
+                        if let Some(cf_ip) = req.headers().get("CF-Connecting-IP") {
+                            if let Ok(ip_str) = cf_ip.to_str() {
+                                ip = Some(ip_str.to_owned());
+                            }
+                        }
+
+                        let ip = ip.unwrap_or("_".to_owned());
+
+                        let result = limiter
+                            .limit_this(
+                                ip,
+                                &BucketConfig {
+                                    name: middleware_bucket_config.name,
+                                    limit_by: LimitEntityType::ProxiedIP,
+                                    max_requests_per_cycle: middleware_bucket_config
+                                        .max_requests_per_cycle,
+                                    cycle_duration: middleware_bucket_config.cycle_duration,
+                                },
+                            )
+                            .await;
+
+                        (false, result)
+                    } else {
+                        (
+                            true,
+                            Ok(LimiterHeaders {
+                                key: "".to_owned(),
+                                bucket: "".to_owned(),
+                                limit: 0,
+                                remaining: 0,
+                                reset: 0,
+                            }),
+                        )
+                    }
                 }
                 _ => (
                     true,

@@ -23,7 +23,7 @@ pub async fn axum_limiter_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    let key = match middleware_bucket_config.limit_by {
+    let key = match middleware_bucket_config.limit_by.clone() {
         LimitEntityType::Global => "_".to_string(),
         LimitEntityType::IP => addr.ip().to_string(),
         LimitEntityType::ProxiedIP => {
@@ -35,11 +35,29 @@ pub async fn axum_limiter_middleware(
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|| addr.ip().to_string()) // Fallback to direct IP
         }
-        // Handle unsupported types explicitly, though configuration should prevent this
+        LimitEntityType::Custom(custom) => {
+            if custom != "cloudflare" {
+                warn!("Unsupported custom limit entity type: {:?}", custom);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Unsupported custom limit entity type",
+                )
+                    .into_response());
+            }
+
+            let mut ip: Option<String> = None;
+            if let Some(cf_ip) = request.headers().get("CF-Connecting-IP") {
+                if let Ok(ip_str) = cf_ip.to_str() {
+                    ip = Some(ip_str.to_owned());
+                }
+            }
+
+            ip.unwrap_or("_".to_owned())
+        }
         _ => {
             warn!(
                 "Unsupported LimitEntityType configured: {:?}",
-                middleware_bucket_config.limit_by
+                middleware_bucket_config.limit_by.clone()
             );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
